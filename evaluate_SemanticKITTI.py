@@ -51,10 +51,12 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument('--resume', default='', type=str, metavar='PATH', help='path to latest checkpoint (default: none)')
 parser.add_argument('--config', default='config/config_kittiSem.yaml', type=str, metavar='PATH', help='path to config file (default: none)')
-parser.add_argument('-v', '--visualize', dest='visualize', action='store_true', help='visualize model on validation set')
-parser.add_argument('-gnd', '--visualize_gnd', dest='visualize_gnd', action='store_true', help='visualize ground elevation')
+parser.add_argument('-v', '--visualize', default=False, dest='visualize', action='store_true', help='visualize model on validation set')
+parser.add_argument('-gnd', '--visualize_gnd',default=False, dest='visualize_gnd', action='store_true', help='visualize ground elevation')
 parser.add_argument('--data_dir', default="/home/anshul/es3cap/semkitti_gndnet/kitti_semantic/dataset/sequences/07/", 
-                        type=str, metavar='PATH', help='path to config file (default: none)')
+                        type=str, metavar='PATH', help='path to dataset (default: none)')
+parser.add_argument('--logdir', default=None, 
+                        type=str, metavar='PATH', help='path to save pred (default: none)')
 args = parser.parse_args()
 
 
@@ -75,7 +77,7 @@ else:
 print("setting batch_size to 1")
 cfg.batch_size = 1
 
-
+'''
 if args.visualize:
 
     # Ros Includes
@@ -87,17 +89,10 @@ if args.visualize:
     rospy.init_node('gnd_data_provider', anonymous=True)
     pcl_pub = rospy.Publisher("/kitti/velo/pointcloud", PointCloud2, queue_size=10)
     marker_pub_2 = rospy.Publisher("/kitti/gnd_marker_pred", Marker, queue_size=10)
-
-
-
-
-
+'''
 
 model = GroundEstimatorNet(cfg).cuda()
 optimizer = optim.SGD(model.parameters(), lr=cfg.lr, momentum=0.9, weight_decay=0.0005)
-
-
-
 
 def get_GndSeg(sem_label, GndClasses):
     index = np.isin(sem_label, GndClasses)
@@ -106,8 +101,6 @@ def get_GndSeg(sem_label, GndClasses):
     index = np.isin(sem_label, [0,1])
     GndSeg[index] = -1
     return GndSeg
-
-
 
 @jit(nopython=True)
 def remove_outliers(pred_GndSeg, GndSeg): # removes the points outside grid and unlabled points
@@ -120,15 +113,10 @@ def remove_outliers(pred_GndSeg, GndSeg): # removes the points outside grid and 
     GndSeg = GndSeg[index]
     return 1-pred_GndSeg, 1-GndSeg
 
-
-
-
 @jit(nopython=True)
 def _shift_cloud(cloud, height):
     cloud += np.array([0,0,height,0], dtype=np.float32)
     return cloud
-
-
 
 def get_target_gnd(cloud, sem_label):
     if cloud.shape[0] != sem_label.shape[0]:
@@ -139,9 +127,6 @@ def get_target_gnd(cloud, sem_label):
     gnd_mask = lidar_to_img(np.copy(gnd), np.asarray(cfg.grid_range), cfg.voxel_size[0], fill = 1)
     gnd_heightmap = lidar_to_heightmap(np.copy(gnd), np.asarray(cfg.grid_range), cfg.voxel_size[0], max_points = 100)
     return  gnd_heightmap, gnd_mask
-
-
-
 
 def InferGround(cloud):
 
@@ -155,8 +140,6 @@ def InferGround(cloud):
     with torch.no_grad():
             output = model(voxels, coors, num_points)
     return output
-
-
 
 # if args.visualize:
 #     plt.ion()
@@ -191,11 +174,13 @@ def evaluate_SemanticKITTI(data_dir):
         pred_GndSeg = segment_cloud(points.copy(),np.asarray(cfg.grid_range), cfg.voxel_size[0], elevation_map = pred_gnd.T, threshold = 0.2)
         GndSeg = get_GndSeg(sem_label, GndClasses = [40, 44, 48, 49,60,72])
         
+        '''
         if args.visualize:
             np2ros_pub_2(points, pcl_pub, None, pred_GndSeg)
             if args.visualize_gnd:
                 gnd_marker_pub(pred_gnd, marker_pub_2, cfg, color = "red")
             # pdb.set_trace()
+        '''
 
         pred_GndSeg, GndSeg = remove_outliers(pred_GndSeg, GndSeg)
         intersection = np.logical_and(GndSeg, pred_GndSeg)
@@ -237,10 +222,39 @@ def evaluate_SemanticKITTI(data_dir):
     print(iou_score, mse_score, prec_score, recall_score)
 
 
+def infer(data_dir):
 
+    dataset_dir = os.path.join(data_dir)
+    sequences = os.listdir(dataset_dir)
+    sequences.sort()
+    for seq in sequences:
+        velodyne_dir = os.path.join(dataset_dir, seq, 'velodyne')
+        frames = os.listdir(velodyne_dir)
+        frames.sort()
+        print(seq)
+        print(len(frames))
 
+        for file in frames:
+            points_path = os.path.join(velodyne_dir, file)
+            points = np.fromfile(points_path, dtype=np.float32).reshape(-1, 4)
 
-
+            #get ground labels
+            pred_gnd = InferGround(points)
+            pred_gnd = pred_gnd.cpu().numpy()
+            pred_GndSeg = segment_cloud(points.copy(),np.asarray(cfg.grid_range), cfg.voxel_size[0], elevation_map = pred_gnd.T, threshold = 0.2)
+        
+            #pred_GndSeg, GndSeg = remove_outliers(pred_GndSeg, GndSeg)
+            #write to file
+            pred_GndSeg = pred_GndSeg.reshape((-1)).astype(np.int16)
+            path = os.path.join(args.logdir, 'ground_removal', seq, "predictions", file)
+            if not os.path.exists(os.path.join(args.logdir, 'ground_removal')):
+                    os.makedirs(os.path.join(args.logdir, 'ground_removal'))
+            if not os.path.exists(os.path.join(args.logdir, 'ground_removal', seq)):
+                    os.makedirs(os.path.join(args.logdir, 'ground_removal', seq))
+            if not os.path.exists(os.path.join(args.logdir, 'ground_removal', seq, "predictions")):
+                    os.makedirs(os.path.join(args.logdir, 'ground_removal', seq, "predictions"))
+            pred_GndSeg.tofile(path)
+        print('{}{}'.format(seq, ' done'))
 
 def main():
     # rospy.init_node('pcl2_pub_example', anonymous=True)
@@ -261,9 +275,8 @@ def main():
     else:
         raise Exception('please specify checkpoint to load')
 
-    evaluate_SemanticKITTI(args.data_dir)
-
-
+    #evaluate_SemanticKITTI(args.data_dir)
+    infer(args.data_dir) 
 
 if __name__ == '__main__':
     main()
